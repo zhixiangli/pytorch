@@ -859,14 +859,28 @@ def _unflatten_optim_state_dict(
                     raise AssertionError(f"Expected list, got {type(params)}")
                 params.append(fqn)
 
-                # Only add state if param requires grad
-                if not param.requires_grad:
-                    continue
+                # The state names to load come from `optim.state` when the
+                # optimizer tracks this param, and from the checkpoint keys
+                # otherwise: a freshly constructed optimizer has no entry for a
+                # frozen param (`_init_optim_state` only fake-steps requires-grad
+                # params), yet the checkpoint may hold state for it (e.g.
+                # trained, then frozen). The caller loads this result via
+                # `Optimizer.load_state_dict`, which replaces `optim.state`
+                # wholesale, so skipping such a param would permanently drop
+                # state the save side does serialize.
+                if param in optim.state:
+                    state_names = list(optim.state[param].keys())
+                else:
+                    prefix = f"{_STATE}.{fqn}."
+                    keys = [k for k in state_dict if k.startswith(prefix)]
+                    state_names = sorted({k[len(prefix) :].split(".")[0] for k in keys})
+                    if not state_names:
+                        continue
 
                 # Reconstruct state for this parameter
                 # pyrefly: ignore [unsupported-operation]
                 state[fqn] = {}
-                for state_name in optim.state[param]:
+                for state_name in state_names:
                     flattened_state_key = f"{_STATE}.{fqn}.{state_name}"
 
                     if flattened_state_key not in state_dict:
@@ -1029,15 +1043,25 @@ def _split_optim_state_dict(
                 if not isinstance(params, list):
                     raise AssertionError(f"Expected list, got {type(params)}")
                 params.append(fqn)
-                if param.requires_grad:
-                    if fqn in cast(DictValueType, optim_state_dict[_STATE]):
-                        state[fqn] = cast(DictValueType, optim_state_dict[_STATE])[fqn]
-                    elif info.strict:
-                        raise RuntimeError(
-                            f"Missing optimizer state for parameter '{fqn}' in checkpoint. "
-                            "The parameter requires gradients but has no saved optimizer state. "
-                            "To load anyway, use StateDictOptions(strict=False)."
-                        )
+                # Load whatever the checkpoint holds for this param, even a
+                # frozen one: the save side serializes state for frozen params
+                # (e.g. trained, then frozen), and `_load_optim_state_dict`
+                # hands this result to `Optimizer.load_state_dict`, which
+                # replaces `optim.state` wholesale. Gating the load on
+                # `requires_grad` or on `optim.state` membership would drop
+                # that state permanently -- a freshly constructed optimizer has
+                # no `optim.state` entry for a frozen param, and the next save
+                # would write a checkpoint without it. To load a checkpoint
+                # while discarding frozen-param state, save with
+                # `ignore_frozen_params=True` instead.
+                if fqn in cast(DictValueType, optim_state_dict[_STATE]):
+                    state[fqn] = cast(DictValueType, optim_state_dict[_STATE])[fqn]
+                elif param.requires_grad and info.strict:
+                    raise RuntimeError(
+                        f"Missing optimizer state for parameter '{fqn}' in checkpoint. "
+                        "The parameter requires gradients but has no saved optimizer state. "
+                        "To load anyway, use StateDictOptions(strict=False)."
+                    )
                 for loaded_param_group in cast(
                     ListDictValueType, optim_state_dict[_PG]
                 ):

@@ -1109,6 +1109,51 @@ class TestNoComm(MultiProcessTestCase):
         set_optimizer_state_dict(model, optim, osd)
         set_optimizer_state_dict(model, optim, optim.state_dict())
 
+    def test_frozen_param_optimizer_state_survives_load(self) -> None:
+        # A frozen param usually has no optimizer state, so skipping it on load
+        # is free. But an optimizer can legitimately hold state for one -- e.g. a
+        # param trained and then frozen, or state materialized deliberately --
+        # and `get_optimizer_state_dict` does serialize that state. Dropping it
+        # on load is therefore destructive, not merely a decision not to load:
+        # `set_optimizer_state_dict` feeds `Optimizer.load_state_dict`, which
+        # replaces `optim.state` wholesale, so the state is lost from both the
+        # optimizer and every checkpoint saved afterwards.
+        model = CompositeParamModel(device=torch.device("cpu"))
+        optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        model(torch.rand(8, 100)).sum().backward()
+        optim.step()  # every param now has AdamW moments
+        optim.zero_grad(set_to_none=True)
+
+        for param in model.u1.parameters():
+            param.requires_grad = False
+        frozen_fqns = {f"u1.{name}" for name, _ in model.u1.named_parameters()}
+
+        osd = get_optimizer_state_dict(model, optim)
+        # The save side keeps state for the now-frozen params ...
+        self.assertTrue(frozen_fqns.issubset(osd["state"].keys()))
+
+        set_optimizer_state_dict(model, optim, osd)
+        reloaded = get_optimizer_state_dict(model, optim)
+        # ... so the load side must not discard it.
+        self.assertEqual(osd["state"].keys(), reloaded["state"].keys())
+        for fqn in frozen_fqns:
+            self.assertEqual(osd["state"][fqn], reloaded["state"][fqn])
+
+        # Restoring into a freshly constructed optimizer (job resumption) is
+        # the harder case: there the frozen params are absent from
+        # `optim.state`, so the load must key off the checkpoint contents.
+        fresh_optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        set_optimizer_state_dict(model, fresh_optim, osd)
+        self.assertEqual(osd, get_optimizer_state_dict(model, fresh_optim))
+
+        # Same for the flattened format, which additionally must recover the
+        # state names of frozen params from the checkpoint keys.
+        flat_options = StateDictOptions(flatten_optimizer_state_dict=True)
+        flat_osd = get_optimizer_state_dict(model, optim, options=flat_options)
+        fresh_optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        set_optimizer_state_dict(model, fresh_optim, flat_osd, options=flat_options)
+        self.assertEqual(osd, get_optimizer_state_dict(model, fresh_optim))
+
 
 if __name__ == "__main__":
     run_tests()
