@@ -628,25 +628,24 @@ def _load_model_state_dict(
 
 def _init_optim_state(optim: torch.optim.Optimizer) -> None:
     """
-    Initialize optim states by calling the step() with zero grads.
+    Initialize missing optim states by calling the step() with zero grads.
     """
-    if optim.state:
-        # The optimizer state is initialized.
+    params = list(chain.from_iterable(g[_PARAMS] for g in optim.param_groups))
+    params_to_init = [
+        param
+        for param in params
+        if param.requires_grad and param not in optim.state
+    ]
+    if not params_to_init:
         return
 
-    # There are some stateless optimizers like SGD. These optimizer will
-    # not return in the above condition. So if gradients exist, we should also
-    # return. If gradients do not exist, the following initialization should
-    # not disturb SGD because the gradients and lr are both zero.
-    for param_group in optim.param_groups:
-        for param in param_group[_PARAMS]:
-            if param.grad is not None:
-                return
+    # Stateless optimizers like SGD do not retain state. If gradients exist,
+    # return. Otherwise, zero gradients and learning rates do not disturb them.
+    if any(param.grad is not None for param in params):
+        return
 
-    for param_group in optim.param_groups:
-        for param in param_group[_PARAMS]:
-            if param.requires_grad:
-                param.grad = torch.zeros_like(param)
+    for param in params_to_init:
+        param.grad = torch.zeros_like(param)
 
     # Some optimizers will update parameters regardless of grads due to lr, so
     # make lr to zero when calling `step()`.
@@ -1029,15 +1028,14 @@ def _split_optim_state_dict(
                 if not isinstance(params, list):
                     raise AssertionError(f"Expected list, got {type(params)}")
                 params.append(fqn)
-                if param.requires_grad:
-                    if fqn in cast(DictValueType, optim_state_dict[_STATE]):
-                        state[fqn] = cast(DictValueType, optim_state_dict[_STATE])[fqn]
-                    elif info.strict:
-                        raise RuntimeError(
-                            f"Missing optimizer state for parameter '{fqn}' in checkpoint. "
-                            "The parameter requires gradients but has no saved optimizer state. "
-                            "To load anyway, use StateDictOptions(strict=False)."
-                        )
+                if fqn in cast(DictValueType, optim_state_dict[_STATE]):
+                    state[fqn] = cast(DictValueType, optim_state_dict[_STATE])[fqn]
+                elif param.requires_grad and info.strict:
+                    raise RuntimeError(
+                        f"Missing optimizer state for parameter '{fqn}' in checkpoint. "
+                        "The parameter requires gradients but has no saved optimizer state. "
+                        "To load anyway, use StateDictOptions(strict=False)."
+                    )
                 for loaded_param_group in cast(
                     ListDictValueType, optim_state_dict[_PG]
                 ):

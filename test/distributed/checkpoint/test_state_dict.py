@@ -47,7 +47,11 @@ from torch.testing._internal.common_dist_composable import (
     UnitModule,
 )
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
-from torch.testing._internal.common_utils import run_tests, TEST_WITH_DEV_DBG_ASAN
+from torch.testing._internal.common_utils import (
+    run_tests,
+    TEST_WITH_DEV_DBG_ASAN,
+    TestCase,
+)
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     MultiProcessTestCase,
@@ -1081,6 +1085,48 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
             },
             _test_multi,
         )
+
+
+class TestOptimizerStateDict(TestCase):
+    def test_frozen_optimizer_state_round_trip(self) -> None:
+        model = nn.Sequential(
+            nn.Linear(2, 2, bias=False),
+            nn.Linear(2, 2, bias=False),
+        )
+        frozen_param, _ = model.parameters()
+        optim = torch.optim.AdamW(model.parameters())
+        sum(param.sum() for param in model.parameters()).backward()
+        optim.step()
+        optim.zero_grad()
+        frozen_param.requires_grad_(False)
+
+        optim_state_dict = get_optimizer_state_dict(model, optim)
+        loaded_optim = torch.optim.AdamW(model.parameters())
+        set_optimizer_state_dict(
+            model,
+            loaded_optim,
+            optim_state_dict=optim_state_dict,
+        )
+
+        self.assertEqual(optim.state_dict(), loaded_optim.state_dict())
+
+    def test_get_optimizer_state_dict_initializes_partial_state(self) -> None:
+        model = nn.Sequential(
+            nn.Linear(2, 2, bias=False),
+            nn.Linear(2, 2, bias=False),
+        )
+        frozen_param, _ = model.parameters()
+        optim = torch.optim.AdamW(model.parameters())
+        frozen_param.sum().backward()
+        optim.step()
+        optim.zero_grad()
+        frozen_param.requires_grad_(False)
+        frozen_state = copy.deepcopy(optim.state[frozen_param])
+
+        optim_state_dict = get_optimizer_state_dict(model, optim)
+
+        self.assertEqual(set(optim_state_dict["state"]), {"0.weight", "1.weight"})
+        self.assertEqual(optim.state[frozen_param], frozen_state)
 
 
 class TestNoComm(MultiProcessTestCase):
