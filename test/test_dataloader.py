@@ -2964,6 +2964,13 @@ except RuntimeError as e:
         old = _utils.worker._worker_info
         try:
             _utils.worker._worker_info = "x"
+            # small tensors are sent by value, see
+            # NOTE [ Sending small tensors from workers by value ]
+            self.assertEqual(dataloader.default_collate([t_in]).is_shared(), False)
+            self.assertEqual(dataloader.default_collate([n_in]).is_shared(), False)
+            max_nbytes = _utils.worker._INLINE_STORAGE_MAX_NBYTES
+            t_in = torch.zeros(max_nbytes + 1, dtype=torch.uint8)
+            n_in = np.zeros(max_nbytes + 1, dtype=np.uint8)
             self.assertEqual(dataloader.default_collate([t_in]).is_shared(), True)
             self.assertEqual(dataloader.default_collate([n_in]).is_shared(), True)
         finally:

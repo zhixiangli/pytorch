@@ -15,6 +15,7 @@ import re
 from collections.abc import Callable
 
 import torch
+from torch.utils.data._utils.worker import _INLINE_STORAGE_MAX_NBYTES
 
 
 np_str_obj_array_pattern = re.compile(r"[SaUO]")
@@ -267,11 +268,13 @@ def collate_tensor_fn(
             "please provide a custom collate_fn to handle them appropriately."
         )
     if torch.utils.data.get_worker_info() is not None:
-        # If we're in a background process, concatenate directly into a
-        # shared memory tensor to avoid an extra copy
         numel = sum(x.numel() for x in batch)
-        storage = elem._typed_storage()._new_shared(numel, device=elem.device)
-        out = elem.new(storage).resize_(len(batch), *list(elem.size()))
+        # If we're in a background process, concatenate directly into a
+        # shared memory tensor to avoid an extra copy. Small tensors are sent
+        # by value instead, see NOTE [ Sending small tensors from workers by value ]
+        if numel * elem.element_size() > _INLINE_STORAGE_MAX_NBYTES:
+            storage = elem._typed_storage()._new_shared(numel, device=elem.device)
+            out = elem.new(storage).resize_(len(batch), *list(elem.size()))
     return torch.stack(batch, 0, out=out)
 
 
