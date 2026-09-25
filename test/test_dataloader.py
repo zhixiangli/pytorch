@@ -1216,6 +1216,21 @@ class CustomDict(dict):
     pass
 
 
+# used with test_worker_sends_small_tensors_by_value
+class SmallAndLargeTensorsDataset(Dataset):
+    def __len__(self):
+        return 8
+
+    def __getitem__(self, idx):
+        base = torch.arange(12, dtype=torch.float64) + idx
+        return {
+            "small": torch.full((3,), idx, dtype=torch.int64),
+            "large": torch.full((64 * 1024,), idx, dtype=torch.float32),
+            "view": base[2:6],
+            "transposed": base.view(3, 4).t(),
+        }
+
+
 def row_processor(row):
     return np.add(row, 1)
 
@@ -1365,7 +1380,7 @@ class RandomDataset(IterableDataset):
 try:
     keep_fds_alive = []
     resource.setrlimit(resource.RLIMIT_NOFILE, (100, 100))
-    for random_t in DataLoader(RandomDataset(200, (2,2)), multiprocessing_context="fork",
+    for random_t in DataLoader(RandomDataset(200, (256, 256)), multiprocessing_context="fork",
                                num_workers=1):
       random_t.max(dim=0)
       keep_fds_alive.append(random_t)
@@ -2954,6 +2969,70 @@ except RuntimeError as e:
         finally:
             _utils.worker._worker_info = old
 
+    def test_inline_small_tensors(self):
+        # See NOTE [ Sending small tensors from workers by value ]
+        from multiprocessing.reduction import ForkingPickler
+
+        from torch.utils.data._utils.worker import (
+            _INLINE_STORAGE_MAX_NBYTES,
+            _InlineBatch,
+        )
+
+        base = torch.arange(12, dtype=torch.float32)
+        small = [
+            torch.tensor(3),
+            torch.tensor([True, False]),
+            torch.tensor([1 + 2j]),
+            torch.arange(4, dtype=torch.bfloat16),
+            torch.arange(8, dtype=torch.uint8),
+            torch.ones(2, requires_grad=True),
+            torch.nn.Parameter(torch.ones(2)),
+        ]
+        large = torch.zeros(_INLINE_STORAGE_MAX_NBYTES + 1, dtype=torch.uint8)
+        nested = torch.nested.nested_tensor([torch.ones(2), torch.ones(3)])
+        strings = ["abc"]
+        batch = CustomDict(
+            small=small,
+            view=base[2:6],
+            transposed=base.view(3, 4).t(),
+            large=(large, large[:4]),
+            nested=nested,
+            aliases=(strings, strings),
+        )
+
+        result = ForkingPickler.loads(ForkingPickler.dumps(_InlineBatch(batch)))
+        self.assertIsInstance(result, CustomDict)
+        for t, r in zip(small, result["small"]):
+            self.assertIs(type(r), type(t))
+            self.assertEqual(r, t)
+            self.assertEqual(r.requires_grad, t.requires_grad)
+            self.assertFalse(r.is_shared())
+        self.assertEqual(result["view"], base[2:6])
+        self.assertEqual(result["transposed"], base.view(3, 4).t())
+        self.assertEqual(result["transposed"].stride(), (1, 4))
+        # tensors sharing a storage in the batch still share it after unpickling
+        result["view"][0] = 100
+        self.assertEqual(result["transposed"][2, 0].item(), 100)
+        self.assertTrue(result["large"][0].is_shared())
+        self.assertEqual(result["large"][1], large[:4])
+        self.assertEqual(result["nested"].unbind(), nested.unbind())
+        self.assertIs(result["aliases"][0], result["aliases"][1])
+
+    def test_worker_sends_small_tensors_by_value(self):
+        # See NOTE [ Sending small tensors from workers by value ]
+        loader = self._get_data_loader(
+            SmallAndLargeTensorsDataset(), batch_size=2, num_workers=2
+        )
+        for i, batch in enumerate(loader):
+            idx = torch.tensor([2 * i, 2 * i + 1])
+            self.assertEqual(batch["small"], idx[:, None].expand(2, 3))
+            self.assertEqual(batch["large"], idx[:, None].expand(2, 64 * 1024).float())
+            base = torch.arange(12, dtype=torch.float64) + idx[:, None]
+            self.assertEqual(batch["view"], base[:, 2:6])
+            self.assertEqual(batch["transposed"], base.view(2, 3, 4).transpose(1, 2))
+            self.assertFalse(batch["small"].is_shared())
+            self.assertTrue(batch["large"].is_shared())
+
     def test_excessive_thread_creation_warning(self):
         with self.assertWarnsRegex(
             UserWarning,
@@ -3322,7 +3401,7 @@ class RandomDataset(IterableDataset):
 try:
     keep_fds_alive = []
     resource.setrlimit(resource.RLIMIT_NOFILE, (100, 100))
-    for random_t in DataLoader(RandomDataset(200, (2,2)), multiprocessing_context="fork",
+    for random_t in DataLoader(RandomDataset(200, (256, 256)), multiprocessing_context="fork",
                                num_workers=1, persistent_workers=True):
       random_t.max(dim=0)
       keep_fds_alive.append(random_t)

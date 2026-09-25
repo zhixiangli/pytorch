@@ -7,10 +7,12 @@ static methods.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import queue
 import random
 from dataclasses import dataclass
+from multiprocessing.reduction import ForkingPickler
 from typing import TYPE_CHECKING
 
 import torch
@@ -23,7 +25,6 @@ if TYPE_CHECKING:
     from torch.utils.data import Dataset
 
 if IS_WINDOWS:
-    import ctypes
     from ctypes.wintypes import BOOL, DWORD, HANDLE
 
     # On Windows, the parent ID of the worker process remains unchanged when the manager process
@@ -73,6 +74,56 @@ else:
 
 
 _worker_info: WorkerInfo | None = None
+
+
+# NOTE [ Sending small tensors from workers by value ]
+#
+# Tensors put on the worker result queue are moved to shared memory and, with the default
+# "file_descriptor" sharing strategy, the main process receives each of them through a
+# `multiprocessing.resource_sharer` connection to the worker: a synchronous, authenticated exchange
+# of several messages that the worker has to serve with the GIL. This costs far more than copying a
+# small tensor, and each message can wait for a whole GIL switch interval when other threads of the
+# worker are running Python code (e.g. threads prefetching data), which can make the main process
+# spend most of its time receiving batches. It also uses one file descriptor per tensor.
+#
+# Small storages are therefore sent by value: batches are pickled with _InlinePickler, which pickles
+# small CPU storages as raw bytes and leaves everything else, including how tensors are rebuilt on top
+# of their storage, to the usual multiprocessing reductions. The pickle memo sends each storage once,
+# so tensors of the batch that share a storage still share it in the main process.
+_INLINE_STORAGE_MAX_NBYTES = 128 * 1024
+
+
+def _rebuild_inline_storage(data: bytes) -> torch.UntypedStorage:
+    return torch.UntypedStorage.from_buffer(data, dtype=torch.uint8)
+
+
+def _reduce_storage_inline(storage: torch.UntypedStorage):
+    if storage.device.type != "cpu" or storage.nbytes() > _INLINE_STORAGE_MAX_NBYTES:
+        # Not imported at module level: this module is imported during `import torch`, and
+        # importing torch.multiprocessing runs init_reductions(), which needs torch.xpu.
+        from torch.multiprocessing.reductions import reduce_storage
+
+        return reduce_storage(storage)
+    data = ctypes.string_at(storage.data_ptr(), storage.nbytes())
+    return (_rebuild_inline_storage, (data,))
+
+
+class _InlinePickler(ForkingPickler):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.dispatch_table[torch.UntypedStorage] = _reduce_storage_inline
+
+
+class _InlineBatch:
+    """Wraps a batch so that it is pickled with _InlinePickler; it unpickles to the batch itself."""
+
+    __slots__ = ("data",)
+
+    def __init__(self, data: object) -> None:
+        self.data = data
+
+    def __reduce__(self):
+        return (ForkingPickler.loads, (bytes(_InlinePickler.dumps(self.data)),))
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,7 +417,7 @@ def _worker_loop(
                 # processing steps.
                 continue
             idx, index = r
-            data: _IterableDatasetStopIteration | ExceptionWrapper
+            data: _IterableDatasetStopIteration | ExceptionWrapper | _InlineBatch
             if init_exception is not None:
                 data = init_exception
                 init_exception = None
@@ -390,6 +441,8 @@ def _worker_loop(
                         data = ExceptionWrapper(
                             where=f"in DataLoader worker process {worker_id}"
                         )
+                else:
+                    data = _InlineBatch(data)
             data_queue.put((idx, data))
             del data, idx, index, r  # save memory
     except KeyboardInterrupt:
