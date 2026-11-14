@@ -233,9 +233,14 @@ class TestConsolidateOnFsspec(_MemoryFsTestCase):
             with open(os.path.join(local_in, name), "wb") as f:
                 f.write(data)
         self._write_remote_shards()
+        # Inputs and outputs may live on different filesystems.
+        local_from_remote = os.path.join(self.temp_dir, "from_remote")
+        os.makedirs(local_from_remote)
         for input_dir, output_dir in (
             (local_in, self.temp_dir),
             (f"{self.root}/sharded", self.root),
+            (local_in, f"{self.root}/from_local"),
+            (f"{self.root}/sharded", local_from_remote),
         ):
             consolidate_safetensors_files(input_dir, output_dir, self.mapping)
 
@@ -245,7 +250,13 @@ class TestConsolidateOnFsspec(_MemoryFsTestCase):
             _metadata_fn,
         ):
             with open(os.path.join(self.temp_dir, name), "rb") as f:
-                self.assertEqual(f.read(), self._read_bytes(f"{self.root}/{name}"))
+                expected = f.read()
+            with open(os.path.join(local_from_remote, name), "rb") as f:
+                self.assertEqual(f.read(), expected)
+            self.assertEqual(self._read_bytes(f"{self.root}/{name}"), expected)
+            self.assertEqual(
+                self._read_bytes(f"{self.root}/from_local/{name}"), expected
+            )
 
 
 @unittest.skipIf(not HAS_SAFETENSORS, "safetensors not installed")

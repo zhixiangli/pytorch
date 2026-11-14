@@ -229,7 +229,8 @@ def _read_tensor_data(
 
 
 def _process_output_file(
-    fs: FileSystemBase,
+    input_fs: FileSystemBase,
+    output_fs: FileSystemBase,
     output_file: str,
     output_data: _OutputFileData,
     input_files_data: dict[str, _InputFileData],
@@ -240,7 +241,8 @@ def _process_output_file(
     This function is designed to be run in parallel for different output files.
 
     Args:
-        fs: Filesystem holding the input and output files
+        input_fs: Filesystem holding the input files
+        output_fs: Filesystem holding the output files
         output_file: Path to the output file
         output_data: Metadata for the output file
         input_files_data: Dictionary mapping input file paths to their metadata
@@ -260,10 +262,10 @@ def _process_output_file(
         # Open all input files for reading
         for safetensors_file in input_files_data:
             file_handles[safetensors_file] = stack.enter_context(
-                fs.create_stream(safetensors_file, "rb")
+                input_fs.create_stream(safetensors_file, "rb")
             )
 
-        with fs.create_stream(output_file, "wb") as output_stream:
+        with output_fs.create_stream(output_file, "wb") as output_stream:
             output_stream.write(header)
             # Process each tensor in sequential output order
             for tensor_fqn, tensor_fqn_data in sorted_tensors:
@@ -317,7 +319,8 @@ def _process_output_file(
 
 
 def _write_data(
-    fs: FileSystemBase,
+    input_fs: FileSystemBase,
+    output_fs: FileSystemBase,
     input_files_data: dict[str, _InputFileData],
     output_files_data: dict[str, _OutputFileData],
     num_threads: int = 1,
@@ -330,7 +333,8 @@ def _write_data(
     the work is split across threads with each thread handling a different output file.
 
     Args:
-        fs: Filesystem holding the input and output files
+        input_fs: Filesystem holding the input files
+        output_fs: Filesystem holding the output files
         input_files_data: Dictionary mapping input file paths to their metadata
         output_files_data: Dictionary mapping output file paths to their metadata
         num_threads: Number of threads to use for parallel processing
@@ -338,7 +342,9 @@ def _write_data(
     if num_threads <= 1 or len(output_files_data) <= 1:
         # Sequential processing
         for output_file, output_data in output_files_data.items():
-            _process_output_file(fs, output_file, output_data, input_files_data)
+            _process_output_file(
+                input_fs, output_fs, output_file, output_data, input_files_data
+            )
     else:
         # Parallel processing with ThreadPoolExecutor
         with concurrent.futures.ThreadPoolExecutor(
@@ -349,7 +355,8 @@ def _write_data(
                 futures.append(
                     executor.submit(
                         _process_output_file,
-                        fs,
+                        input_fs,
+                        output_fs,
                         output_file,
                         output_data,
                         input_files_data,
@@ -557,7 +564,8 @@ def _write_overall_metadata_file(
 
 
 def _consolidate_safetensors_files(
-    fs: "FileSystem | _FileSystem",
+    input_fs: "FileSystem | _FileSystem",
+    output_fs: FileSystemBase,
     input_dir: str,
     output_dir: str,
     fqn_to_file_mapping: dict[str, str],
@@ -571,12 +579,12 @@ def _consolidate_safetensors_files(
     written, so a file whose entries were all left out holds no tensors.
     """
     # Find all safetensors files in the input directory
-    safetensors_files = [f for f in fs.ls(input_dir) if f.endswith(SUFFIX)]
+    safetensors_files = [f for f in input_fs.ls(input_dir) if f.endswith(SUFFIX)]
 
     # Read metadata from all input files
     input_files_data: dict[str, _InputFileData] = {}
     for safetensor_file in safetensors_files:
-        with fs.create_stream(safetensor_file, "rb") as f:
+        with input_fs.create_stream(safetensor_file, "rb") as f:
             metadata, size = _get_safetensors_file_metadata(f)
             input_files_data[safetensor_file] = _InputFileData(
                 metadata_size=size, metadata=metadata
@@ -589,7 +597,7 @@ def _consolidate_safetensors_files(
     output_files_data: dict[str, _OutputFileData] = {}
     # Create multiple output files based on the provided mapping
     for fqn, filename in fqn_to_file_mapping.items():
-        output_path = str(fs.concat_path(output_dir, filename))
+        output_path = str(output_fs.concat_path(output_dir, filename))
 
         if output_path not in output_files_data:
             output_files_data[output_path] = _OutputFileData()
@@ -600,7 +608,7 @@ def _consolidate_safetensors_files(
     _parse_input_metadata(input_files_data, output_files_data)
 
     # Step 2: Write metadata headers and tensor data to output files
-    _write_data(fs, input_files_data, output_files_data, num_threads)
+    _write_data(input_fs, output_fs, input_files_data, output_files_data, num_threads)
 
     return output_files_data
 
@@ -659,7 +667,8 @@ def consolidate_safetensors_files(
         output_dir,
         start_time,
     )
-    fs, _ = _get_fs_and_path(input_dir)
+    input_fs, _ = _get_fs_and_path(input_dir)
+    output_fs, _ = _get_fs_and_path(output_dir)
 
     max_index = max(fqn_to_index_mapping.values())
     fqn_to_file_mapping = {
@@ -667,11 +676,11 @@ def consolidate_safetensors_files(
     }
 
     output_files_data = _consolidate_safetensors_files(
-        fs, input_dir, output_dir, fqn_to_file_mapping, num_threads
+        input_fs, output_fs, input_dir, output_dir, fqn_to_file_mapping, num_threads
     )
 
     # Step 4: Write overall model.index.safetensors.json file with weight map
-    _write_overall_metadata_file(fs, output_dir, output_files_data)
+    _write_overall_metadata_file(output_fs, output_dir, output_files_data)
 
     logger.info("Done consolidating. Took %.2f secs.", time.time() - start_time)
     _warn_skipped_fqns(input_dir, fqn_to_index_mapping, output_files_data)
@@ -704,7 +713,8 @@ def consolidate_safetensors_files_on_every_rank(
     """
 
     start_time = time.time()
-    fs, _ = _get_fs_and_path(input_dir)
+    input_fs, _ = _get_fs_and_path(input_dir)
+    output_fs, _ = _get_fs_and_path(output_dir)
     # Derive rank and world_size from process_group or default distributed environment
     if dist.is_available() and dist.is_initialized():
         rank = dist.get_rank(group=process_group)
@@ -759,7 +769,8 @@ def consolidate_safetensors_files_on_every_rank(
 
         # Call the existing consolidation function with the filtered mapping
         output_files_data = _consolidate_safetensors_files(
-            fs=fs,
+            input_fs=input_fs,
+            output_fs=output_fs,
             input_dir=input_dir,
             output_dir=output_dir,
             fqn_to_file_mapping=filtered_filename_mapping,
@@ -793,7 +804,7 @@ def consolidate_safetensors_files_on_every_rank(
             for rank_data in gathered_output_files_data:
                 all_output_files_data.update(rank_data)
 
-            _write_overall_metadata_file(fs, output_dir, all_output_files_data)
+            _write_overall_metadata_file(output_fs, output_dir, all_output_files_data)
             logger.info("Rank 0: Wrote overall metadata file.")
             logger.info("Total time taken: %.2f secs.", time.time() - start_time)
         dist.barrier(group=process_group)
