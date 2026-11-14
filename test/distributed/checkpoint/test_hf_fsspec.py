@@ -174,6 +174,7 @@ class TestFsspecSafetensorsFile(_MemoryFsTestCase):
 
 
 @unittest.skipIf(not HAS_SAFETENSORS, "safetensors not installed")
+@instantiate_parametrized_tests
 class TestConsolidateOnFsspec(_MemoryFsTestCase):
     hw_classification = HardwareClassification.GENERIC
 
@@ -203,7 +204,9 @@ class TestConsolidateOnFsspec(_MemoryFsTestCase):
         for name, data in self.shards.items():
             self._write_bytes(f"{self.root}/sharded/{name}", data)
 
-    def test_consolidate_to_remote(self) -> None:
+    # num_threads=2 writes the two output files from worker threads.
+    @parametrize("num_threads", [1, 2])
+    def test_consolidate_to_remote(self, num_threads: int) -> None:
         from safetensors.torch import load
 
         self._write_remote_shards()
@@ -211,6 +214,7 @@ class TestConsolidateOnFsspec(_MemoryFsTestCase):
             input_dir=f"{self.root}/sharded",
             output_dir=self.root,
             fqn_to_index_mapping=self.mapping,
+            num_threads=num_threads,
         )
 
         w_file = self._read_bytes(f"{self.root}/model-00001-of-00002.safetensors")
@@ -225,6 +229,19 @@ class TestConsolidateOnFsspec(_MemoryFsTestCase):
                 "b": "model-00002-of-00002.safetensors",
             },
         )
+
+    def test_consolidate_several_tensors_per_file(self) -> None:
+        from safetensors.torch import load
+
+        self._write_remote_shards()
+        consolidate_safetensors_files(
+            input_dir=f"{self.root}/sharded",
+            output_dir=self.root,
+            fqn_to_index_mapping={"w": 1, "b": 1},
+        )
+
+        data = self._read_bytes(f"{self.root}/model-00001-of-00001.safetensors")
+        self.assertEqual(load(data), {"w": self.w, "b": self.b})
 
     def test_local_and_remote_outputs_are_identical(self) -> None:
         local_in = os.path.join(self.temp_dir, "sharded")
@@ -380,33 +397,53 @@ class TestQuantizedHfStorageOnFsspec(_MemoryFsTestCase):
     def test_scale_in_separate_file(self) -> None:
         from safetensors.torch import save
 
-        original = torch.randn(256, 128)
-        weight_file = "model-00001-of-00002.safetensors"
-        scale_file = "model-00002-of-00002.safetensors"
+        # Each weight's scale lives in the other file, so with two files the
+        # reader's worker threads open scale files while reading weights.
+        original1 = torch.randn(256, 128)
+        original2 = torch.randn(256, 128)
+        file1 = "model-00001-of-00002.safetensors"
+        file2 = "model-00002-of-00002.safetensors"
         self._write_bytes(
-            f"{self.root}/{weight_file}", save({"linear.weight": original / 2.0})
+            f"{self.root}/{file1}",
+            save(
+                {
+                    "linear1.weight": original1 / 2.0,
+                    "linear2.weight_scale_inv": torch.full((2, 1), 4.0),
+                }
+            ),
         )
         self._write_bytes(
-            f"{self.root}/{scale_file}",
-            save({"linear.weight_scale_inv": torch.full((2, 1), 2.0)}),
+            f"{self.root}/{file2}",
+            save(
+                {
+                    "linear2.weight": original2 / 4.0,
+                    "linear1.weight_scale_inv": torch.full((2, 1), 2.0),
+                }
+            ),
         )
         weight_map = {
-            "linear.weight": weight_file,
-            "linear.weight_scale_inv": scale_file,
+            "linear1.weight": file1,
+            "linear2.weight_scale_inv": file1,
+            "linear2.weight": file2,
+            "linear1.weight_scale_inv": file2,
         }
         self._write_bytes(
             f"{self.root}/{_metadata_fn}",
             json.dumps({"weight_map": weight_map}).encode(),
         )
 
-        loaded = {"linear.weight": torch.zeros(256, 128)}
+        loaded = {
+            "linear1.weight": torch.zeros(256, 128),
+            "linear2.weight": torch.zeros(256, 128),
+        }
         dist_cp.load(
             loaded,
             storage_reader=QuantizedHuggingFaceStorageReader(
                 path=self.root, block_size=128, thread_count=2
             ),
         )
-        self.assertEqual(loaded["linear.weight"], original)
+        self.assertEqual(loaded["linear1.weight"], original1)
+        self.assertEqual(loaded["linear2.weight"], original2)
 
 
 if __name__ == "__main__":
