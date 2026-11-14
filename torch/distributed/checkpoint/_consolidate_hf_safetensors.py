@@ -19,13 +19,15 @@ from torch.distributed.checkpoint._hf_utils import (
     _get_dcp_custom_metadata,
     _get_fs_and_path,
     _get_safetensors_file_metadata,
+    _list_safetensors_files,
+    _map_over_files,
     _metadata_fn,
+    _open_for_ranged_reads,
     DATA_OFFSETS_KEY,
     DEFAULT_EXTRA_METADATA_KEY,
     DTYPE_KEY,
     SAVED_OFFSETS_KEY,
     SHAPE_KEY,
-    SUFFIX,
 )
 from torch.distributed.checkpoint.filesystem import FileSystemBase
 
@@ -253,6 +255,13 @@ def _process_output_file(
         output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file
     )
 
+    # With fqn_to_index_mapping every rank writes one shard per output file, so
+    # most input files hold none of this output's tensors.
+    input_files_data = {
+        safetensors_file: file_data
+        for safetensors_file, file_data in input_files_data.items()
+        if not output_data.fqn_data.keys().isdisjoint(file_data.metadata)
+    }
     file_handles = {}
     dcp_metadata = {}
     for safetensors_file, file_data in input_files_data.items():
@@ -262,7 +271,7 @@ def _process_output_file(
         # Open all input files for reading
         for safetensors_file in input_files_data:
             file_handles[safetensors_file] = stack.enter_context(
-                input_fs.create_stream(safetensors_file, "rb")
+                _open_for_ranged_reads(input_fs, safetensors_file)
             )
 
         with output_fs.create_stream(output_file, "wb") as output_stream:
@@ -579,21 +588,26 @@ def _consolidate_safetensors_files(
     written, so a file whose entries were all left out holds no tensors.
     """
     # Find all safetensors files in the input directory
-    safetensors_files = [f for f in input_fs.ls(input_dir) if f.endswith(SUFFIX)]
+    safetensors_files = _list_safetensors_files(input_fs, input_dir)
 
     # Read metadata from all input files
-    input_files_data: dict[str, _InputFileData] = {}
-    for safetensor_file in safetensors_files:
-        with input_fs.create_stream(safetensor_file, "rb") as f:
+    def read_input_file(safetensor_file: str) -> _InputFileData:
+        with _open_for_ranged_reads(input_fs, safetensor_file) as f:
             metadata, size = _get_safetensors_file_metadata(f)
-            input_files_data[safetensor_file] = _InputFileData(
-                metadata_size=size, metadata=metadata
-            )
+        return _InputFileData(metadata_size=size, metadata=metadata)
+
+    input_files_data: dict[str, _InputFileData] = dict(
+        zip(
+            safetensors_files,
+            _map_over_files(input_fs, read_input_file, safetensors_files),
+        )
+    )
 
     # Names with no saved tensor would get an empty dtype, which readers reject
     input_fqns = {fqn for data in input_files_data.values() for fqn in data.metadata}
     input_fqns.discard(DEFAULT_EXTRA_METADATA_KEY)
 
+    output_fs.mkdir(output_dir)
     output_files_data: dict[str, _OutputFileData] = {}
     # Create multiple output files based on the provided mapping
     for fqn, filename in fqn_to_file_mapping.items():
@@ -812,4 +826,5 @@ def consolidate_safetensors_files_on_every_rank(
         if rank == 0:
             _warn_skipped_fqns(input_dir, fqn_to_index_mapping, all_output_files_data)
     else:
+        _write_overall_metadata_file(output_fs, output_dir, output_files_data)
         _warn_skipped_fqns(input_dir, fqn_to_index_mapping, output_files_data)

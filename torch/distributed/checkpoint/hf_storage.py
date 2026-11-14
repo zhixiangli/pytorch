@@ -2,6 +2,7 @@
 import dataclasses
 import json
 import logging
+import os
 import queue
 import threading
 from typing import Any
@@ -17,10 +18,10 @@ from torch.distributed.checkpoint._hf_utils import (
     _HFStorageInfo,
     _metadata_fn,
     _open_safetensors,
+    _open_safetensors_headers,
     CUSTOM_METADATA_KEY,
     SAVED_OFFSETS_KEY,
     SHARDED_DIR_NAME,
-    SUFFIX,
 )
 from torch.distributed.checkpoint.filesystem import SerializationFormat
 from torch.distributed.checkpoint.metadata import (
@@ -93,13 +94,29 @@ class HuggingFaceStorageWriter(FileSystemWriter):
         self.save_distributed: bool = save_distributed
         self.enable_consolidation: bool = enable_consolidation
         self.consolidated_output_path: str | None = None
+        self._init_path(path)
+        self.thread_count_consolidation = thread_count_consolidation
+
+    def _init_path(self, path: str | os.PathLike) -> None:
         # The parent declares fs as FileSystem; this may be an fsspec _FileSystem.
         # pyrefly: ignore [bad-override]
         self.fs, self.path = _get_fs_and_path(path)
         if self.enable_consolidation:
             self.consolidated_output_path = str(self.path)
             self.path = self.fs.concat_path(self.path, SHARDED_DIR_NAME)
-        self.thread_count_consolidation = thread_count_consolidation
+
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        super().reset(None)
+        if checkpoint_id:
+            self._init_path(checkpoint_id)
+
+    @classmethod
+    def validate_checkpoint_id(cls, checkpoint_id: str | os.PathLike) -> bool:
+        if "://" in str(checkpoint_id):
+            from torch.distributed.checkpoint.fsspec_filesystem import _FileSystem
+
+            return _FileSystem.validate_checkpoint_id(checkpoint_id)
+        return super().validate_checkpoint_id(checkpoint_id)
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
         new_plans = []
@@ -228,6 +245,20 @@ class HuggingFaceStorageReader(FileSystemReader):
         self.fs, self.path = _get_fs_and_path(path)
         self.thread_count = thread_count
 
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        super().reset(None)
+        if checkpoint_id:
+            # pyrefly: ignore [bad-override]
+            self.fs, self.path = _get_fs_and_path(checkpoint_id)
+
+    @classmethod
+    def validate_checkpoint_id(cls, checkpoint_id: str | os.PathLike) -> bool:
+        if "://" in str(checkpoint_id):
+            from torch.distributed.checkpoint.fsspec_filesystem import _FileSystem
+
+            return _FileSystem.validate_checkpoint_id(checkpoint_id)
+        return super().validate_checkpoint_id(checkpoint_id)
+
     def _process_read_request(self, f, req: ReadItem, planner: LoadPlanner) -> None:
         """Helper function to process a single read request."""
         # Create slices for each dimension based on offsets and lengths
@@ -324,13 +355,8 @@ class HuggingFaceStorageReader(FileSystemReader):
         state_dict_metadata: dict[str, TensorStorageMetadata] = {}
         storage_data: dict[MetadataIndex, _HFStorageInfo] = {}
 
-        safetensors_files = []
-        for file in self.fs.ls(self.path):
-            if file.endswith(SUFFIX):
-                safetensors_files.append(file)
-
-        for safetensor_file in safetensors_files:
-            with _open_safetensors(self.fs, safetensor_file) as f:
+        for safetensor_file, ctx in _open_safetensors_headers(self.fs, self.path):
+            with ctx as f:
                 keys = f.keys()
                 extra_metadata = f.metadata()
 

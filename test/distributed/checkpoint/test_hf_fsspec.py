@@ -3,10 +3,12 @@
 import importlib.util
 import json
 import os
+import posixpath
 import shutil
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 import fsspec
 
@@ -14,9 +16,11 @@ import torch
 import torch.distributed.checkpoint as dist_cp
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files,
+    consolidate_safetensors_files_on_every_rank,
 )
 from torch.distributed.checkpoint._hf_utils import (
     _get_fs_and_path,
+    _list_safetensors_files,
     _metadata_fn,
     _open_safetensors,
 )
@@ -171,8 +175,41 @@ class TestFsspecSafetensorsFile(_MemoryFsTestCase):
             for key, tensor in self.tensors.items():
                 self.assertEqual(remote.get_tensor(key), tensor)
 
+    def test_list_safetensors_files(self) -> None:
+        self._write_bytes(f"{self.root}/b.safetensors", b"")
+        self._write_bytes(f"{self.root}/model.safetensors.index.json", b"{}")
+        fs, path = _get_fs_and_path(self.root)
+        files = _list_safetensors_files(fs, path)
+        self.assertEqual(
+            [posixpath.basename(f) for f in files], ["b.safetensors", "f.safetensors"]
+        )
+
+    def test_list_invalidates_fsspec_cache(self) -> None:
+        fs, path = _get_fs_and_path(self.root)
+        with mock.patch.object(fs.fs, "invalidate_cache") as invalidate:
+            _list_safetensors_files(fs, path)
+        invalidate.assert_called_once_with()
+
+    def test_remote_reads_disable_readahead(self) -> None:
+        with mock.patch.object(
+            self.remote_fs.fs, "open", wraps=self.remote_fs.fs.open
+        ) as fs_open:
+            with _open_safetensors(self.remote_fs, self.remote_path) as remote:
+                remote.get_slice("a")[(slice(1, 3),)]
+        fs_open.assert_called_once_with(self.remote_path, "rb", cache_type="none")
+
+    def test_truncated_file_raises(self) -> None:
+        from safetensors.torch import save
+
+        path = f"{self.root}/truncated.safetensors"
+        self._write_bytes(path, save({"x": torch.arange(100.0)})[:-8])
+        with _open_safetensors(self.remote_fs, path) as remote:
+            with self.assertRaisesRegex(ValueError, "Truncated safetensors file"):
+                remote.get_tensor("x")
+
 
 @unittest.skipIf(not HAS_SAFETENSORS, "safetensors not installed")
+@instantiate_parametrized_tests
 class TestConsolidateOnFsspec(_MemoryFsTestCase):
     hw_classification = HardwareClassification.GENERIC
 
@@ -206,11 +243,21 @@ class TestConsolidateOnFsspec(_MemoryFsTestCase):
         from safetensors.torch import load
 
         self._write_remote_shards()
-        consolidate_safetensors_files(
-            input_dir=f"{self.root}/sharded",
-            output_dir=self.root,
-            fqn_to_index_mapping=self.mapping,
-        )
+        with mock.patch.object(
+            self.memory_fs, "open", wraps=self.memory_fs.open
+        ) as fs_open:
+            consolidate_safetensors_files(
+                input_dir=f"{self.root}/sharded",
+                output_dir=self.root,
+                fqn_to_index_mapping=self.mapping,
+            )
+
+        # shard-00002 holds only "w" (output file 1), so output file 2 ("b") must
+        # not open it: 1 header read + 1 data read = 2 opens.
+        shard2_opens = [
+            call for call in fs_open.call_args_list if "shard-00002" in call.args[0]
+        ]
+        self.assertEqual(len(shard2_opens), 2)
 
         w_file = self._read_bytes(f"{self.root}/model-00001-of-00002.safetensors")
         b_file = self._read_bytes(f"{self.root}/model-00002-of-00002.safetensors")
@@ -270,6 +317,61 @@ class TestConsolidateOnFsspec(_MemoryFsTestCase):
                 self._read_bytes(f"{self.root}/from_local/{name}"), expected
             )
 
+    def test_consolidate_on_every_rank_without_dist(self) -> None:
+        from safetensors.torch import load
+
+        self._write_remote_shards()
+        consolidate_safetensors_files_on_every_rank(
+            input_dir=f"{self.root}/sharded",
+            output_dir=self.root,
+            fqn_to_index_mapping=self.mapping,
+        )
+        w_file = self._read_bytes(f"{self.root}/model-00001-of-00002.safetensors")
+        b_file = self._read_bytes(f"{self.root}/model-00002-of-00002.safetensors")
+        self.assertEqual(load(w_file), {"w": self.w})
+        self.assertEqual(load(b_file), {"b": self.b})
+        index = json.loads(self._read_bytes(f"{self.root}/{_metadata_fn}"))
+        self.assertEqual(
+            index["weight_map"],
+            {
+                "w": "model-00001-of-00002.safetensors",
+                "b": "model-00002-of-00002.safetensors",
+            },
+        )
+
+    @parametrize("remote_input", [True, False])
+    @parametrize("use_file_uri", [False, True])
+    def test_consolidate_on_every_rank_across_filesystems(
+        self, remote_input: bool, use_file_uri: bool
+    ) -> None:
+        from safetensors.torch import load
+
+        local_path = os.path.join(self.temp_dir, "dir")
+        local_dir = f"file://{local_path}" if use_file_uri else local_path
+        if remote_input:
+            self._write_remote_shards()
+            input_dir, output_dir = f"{self.root}/sharded", local_dir
+        else:
+            os.makedirs(local_path)
+            for name, data in self.shards.items():
+                with open(os.path.join(local_path, name), "wb") as f:
+                    f.write(data)
+            input_dir, output_dir = local_dir, f"{self.root}/out"
+
+        consolidate_safetensors_files_on_every_rank(input_dir, output_dir, self.mapping)
+
+        def read(name: str) -> bytes:
+            if remote_input:
+                with open(os.path.join(local_path, name), "rb") as f:
+                    return f.read()
+            return self._read_bytes(f"{output_dir}/{name}")
+
+        self.assertEqual(load(read("model-00001-of-00002.safetensors")), {"w": self.w})
+        self.assertEqual(load(read("model-00002-of-00002.safetensors")), {"b": self.b})
+        self.assertEqual(
+            json.loads(read(_metadata_fn))["weight_map"].keys(), {"w", "b"}
+        )
+
 
 @unittest.skipIf(not HAS_SAFETENSORS, "safetensors not installed")
 class TestHfStorageOnFsspec(_MemoryFsTestCase):
@@ -315,6 +417,52 @@ class TestHfStorageOnFsspec(_MemoryFsTestCase):
             dist_cp.HuggingFaceStorageReader(path=self.path, thread_count=2)
         )
         self.assertEqual(loaded, self.state_dict)
+
+    def test_checkpoint_id_switches_filesystem(self) -> None:
+        # Storage built on a local path, then pointed at a URI via checkpoint_id.
+        writer = dist_cp.HuggingFaceStorageWriter(
+            path=self.temp_dir,
+            fqn_to_index_mapping={"w": 1, "b": 2},
+            save_distributed=True,
+            enable_consolidation=True,
+        )
+        dist_cp.save(self.state_dict, checkpoint_id=self.path, storage_writer=writer)
+        for name in (
+            "sharded/shard-00001-model-00001-of-00002.safetensors",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            _metadata_fn,
+        ):
+            self.assertTrue(self.memory_fs.exists(f"/{self.name}/ckpt/{name}"))
+        self.assertEqual(os.listdir(self.temp_dir), [])
+
+        loaded = {k: torch.zeros_like(v) for k, v in self.state_dict.items()}
+        reader = dist_cp.HuggingFaceStorageReader(path=self.temp_dir)
+        dist_cp.load(loaded, checkpoint_id=self.path, storage_reader=reader)
+        self.assertEqual(loaded, self.state_dict)
+
+        # Switching back from remote to local does not re-initialize the old remote fs.
+        local_ckpt = os.path.join(self.temp_dir, "local_ckpt")
+        with mock.patch.object(writer.fs, "init_path") as remote_writer_init:
+            dist_cp.save(
+                self.state_dict, checkpoint_id=local_ckpt, storage_writer=writer
+            )
+        remote_writer_init.assert_not_called()
+
+        loaded_local = {k: torch.zeros_like(v) for k, v in self.state_dict.items()}
+        with mock.patch.object(reader.fs, "init_path") as remote_reader_init:
+            dist_cp.load(loaded_local, checkpoint_id=local_ckpt, storage_reader=reader)
+        remote_reader_init.assert_not_called()
+        self.assertEqual(loaded_local, self.state_dict)
+
+    def test_validate_checkpoint_id(self) -> None:
+        for cls in (
+            dist_cp.HuggingFaceStorageWriter,
+            dist_cp.HuggingFaceStorageReader,
+            QuantizedHuggingFaceStorageReader,
+        ):
+            self.assertTrue(cls.validate_checkpoint_id(self.temp_dir))
+            self.assertTrue(cls.validate_checkpoint_id(self.path))
 
 
 @unittest.skipIf(not HAS_SAFETENSORS, "safetensors not installed")

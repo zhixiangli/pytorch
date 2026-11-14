@@ -3,11 +3,12 @@ import json
 import math
 import os
 import struct
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import EllipsisType
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, TypeVar
 
 import torch
 
@@ -56,6 +57,10 @@ FORMAT_VALUE = "pt"
 NUM_BYTES_FOR_HEADER_LEN = 8
 
 SHARDED_DIR_NAME = "sharded"
+
+_MAX_REMOTE_READ_THREADS = 16
+
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -112,6 +117,49 @@ def _get_fs_and_path(
     return fs, fs.init_path(path)
 
 
+def _list_safetensors_files(
+    fs: "FileSystem | _FileSystem", path: str | os.PathLike
+) -> list[str]:
+    from torch.distributed.checkpoint.fsspec_filesystem import _FileSystem
+
+    if isinstance(fs, _FileSystem) and fs.fs is not None:
+        # Other ranks may have just written these files, and fsspec's listing
+        # cache only sees writes made through the same filesystem instance.
+        fs.fs.invalidate_cache()
+    return sorted(f for f in fs.ls(path) if f.endswith(SUFFIX))
+
+
+@contextmanager
+def _open_for_ranged_reads(
+    fs: "FileSystemBase", path: str | os.PathLike
+) -> Generator[io.IOBase, None, None]:
+    """Open ``path`` for reads whose byte ranges the caller already knows."""
+    from torch.distributed.checkpoint.fsspec_filesystem import _FileSystem
+
+    if isinstance(fs, _FileSystem) and fs.fs is not None:
+        # fsspec's default readahead cache fetches a whole extra block (5 MiB
+        # on gcsfs) per read, so a header read would download 5 MiB per file.
+        with fs.fs.open(os.fspath(path), "rb", cache_type="none") as stream:
+            yield stream
+    else:
+        with fs.create_stream(path, "rb") as stream:
+            yield stream
+
+
+def _map_over_files(
+    fs: "FileSystemBase", fn: Callable[[str], _T], files: list[str]
+) -> list[_T]:
+    """Apply ``fn`` to each file, in parallel on remote filesystems where each call is a round trip."""
+    from torch.distributed.checkpoint.filesystem import FileSystem
+
+    if isinstance(fs, FileSystem) or len(files) <= 1:
+        return [fn(f) for f in files]
+    with ThreadPoolExecutor(
+        max_workers=min(_MAX_REMOTE_READ_THREADS, len(files))
+    ) as ex:
+        return list(ex.map(fn, files))
+
+
 class _FsspecSafetensorsSlice:
     def __init__(self, file: "_FsspecSafetensorsFile", name: str) -> None:
         self._file = file
@@ -166,6 +214,12 @@ class _FsspecSafetensorsFile:
         self._metadata = header.pop(DEFAULT_EXTRA_METADATA_KEY, None)
         self._header = header
 
+    def __enter__(self) -> "_FsspecSafetensorsFile":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        pass
+
     def keys(self) -> list[str]:
         return sorted(self._header)
 
@@ -185,6 +239,11 @@ class _FsspecSafetensorsFile:
             return torch.empty(shape, dtype=dtype)
         self._stream.seek(self._data_start + offset)
         data = bytearray(self._stream.read(nbytes))
+        if len(data) != nbytes:
+            raise ValueError(
+                f"Truncated safetensors file: expected {nbytes} bytes at data offset "
+                f"{offset}, got {len(data)}"
+            )
         return torch.frombuffer(data, dtype=dtype).view(shape)
 
 
@@ -200,8 +259,24 @@ def _open_safetensors(
         with safe_open(path, framework="pt") as f:
             yield f
     else:
-        with fs.create_stream(path, "rb") as stream:
+        with _open_for_ranged_reads(fs, path) as stream:
             yield _FsspecSafetensorsFile(stream)
+
+
+def _open_safetensors_headers(
+    fs: "FileSystem | _FileSystem", path: str | os.PathLike
+) -> list[tuple[str, Any]]:
+    from torch.distributed.checkpoint.filesystem import FileSystem
+
+    files = _list_safetensors_files(fs, path)
+    if isinstance(fs, FileSystem):
+        return [(f, _open_safetensors(fs, f)) for f in files]
+
+    def read_header(f: str) -> _FsspecSafetensorsFile:
+        with _open_for_ranged_reads(fs, f) as stream:
+            return _FsspecSafetensorsFile(stream)
+
+    return list(zip(files, _map_over_files(fs, read_header, files)))
 
 
 def _get_dtype(dtype_str: str) -> torch.dtype:
