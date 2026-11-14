@@ -2,6 +2,7 @@
 import dataclasses
 import json
 import logging
+import os
 import queue
 import threading
 from typing import Any
@@ -95,6 +96,12 @@ class HuggingFaceStorageWriter(FileSystemWriter):
             self.consolidated_output_path = str(self.path)
             self.path = self.fs.concat_path(self.path, SHARDED_DIR_NAME)
         self.thread_count_consolidation = thread_count_consolidation
+
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        super().reset(checkpoint_id)
+        if checkpoint_id and self.enable_consolidation:
+            self.consolidated_output_path = str(self.path)
+            self.path = self.fs.concat_path(self.path, SHARDED_DIR_NAME)
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
         new_plans = []
