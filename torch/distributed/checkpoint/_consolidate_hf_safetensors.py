@@ -12,7 +12,6 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
-import torch
 from torch import distributed as dist
 from torch.distributed.checkpoint._hf_utils import (
     _gen_file_name,
@@ -135,8 +134,7 @@ def _parse_input_metadata(
             if fqn in output_data.fqn_data:
                 output_data.fqn_data[fqn] = _FqnData(
                     shape_in_file=tensor_size,
-                    dtype_size=torch.finfo(_getdtype(dtype_str)).bits
-                    // 8,  # Convert bits to bytes
+                    dtype_size=_getdtype(dtype_str).itemsize,
                     dtype_str=dtype_str,
                 )
 

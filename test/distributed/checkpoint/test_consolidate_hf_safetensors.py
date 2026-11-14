@@ -421,6 +421,31 @@ class TestConsolidateHFSafeTensorsNoProcessGroup(DTensorTestBase):
         ):
             _warn_skipped_fqns("ckpt", mapping, {})
 
+    @with_temp_dir
+    def test_consolidate_non_float_dtypes(self) -> None:
+        if importlib.util.find_spec("safetensors") is None:
+            self.skipTest("safetensors not installed")
+        import safetensors.torch
+
+        for dtype in (torch.float32, torch.int64, torch.uint8, torch.bool):
+            with self.subTest(dtype=dtype):
+                checkpoint_dir = os.path.join(self.temp_dir, str(dtype))
+                output_dir = os.path.join(checkpoint_dir, "consolidated")
+                os.makedirs(output_dir)
+                tensor = torch.arange(16).view(4, 4).to(dtype)
+                dist_cp.save(
+                    {"t": tensor},
+                    storage_writer=dist_cp.HuggingFaceStorageWriter(
+                        path=checkpoint_dir, save_distributed=True
+                    ),
+                    no_dist=True,
+                )
+                consolidate_safetensors_files(
+                    checkpoint_dir, output_dir, fqn_to_index_mapping={"t": 1}
+                )
+                file_path = os.path.join(output_dir, "model-00001-of-00001.safetensors")
+                self.assertEqual(safetensors.torch.load_file(file_path)["t"], tensor)
+
 
 if __name__ == "__main__":
     run_tests()
