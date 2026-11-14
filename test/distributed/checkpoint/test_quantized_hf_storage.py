@@ -317,6 +317,40 @@ class TestQuantizedHfStorage(TestCase):
         committed = planner.commit_tensor.call_args[0][1]
         torch.testing.assert_close(committed, expected[1:3, 40:90])
 
+    def test_reset_clears_quantization_state(self):
+        try:
+            import safetensors  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("safetensors not installed") from None
+
+        ckpt1 = os.path.join(self.path, "ckpt1")
+        ckpt2 = os.path.join(self.path, "ckpt2")
+        os.makedirs(ckpt1)
+        os.makedirs(ckpt2)
+        save_hf_checkpoint(
+            ckpt1,
+            {
+                "model.safetensors": {
+                    "linear.weight": torch.ones(4, 4),
+                    "linear.weight_scale_inv": torch.full((1, 1), 2.0),
+                }
+            },
+        )
+        save_hf_checkpoint(
+            ckpt2,
+            {"model.safetensors": {"linear.weight": torch.full((4, 4), 3.0)}},
+        )
+        reader = QuantizedHuggingFaceStorageReader(path=ckpt1, block_size=4)
+        reader.read_metadata()
+        self.assertIn("linear.weight", reader._weight_scale_mapping)
+
+        reader.reset(ckpt2)
+        self.assertEqual(reader._weight_scale_mapping, {})
+        self.assertEqual(reader._weight_map, {})
+        self.assertEqual(reader._tensor_full_shapes, {})
+        reader.read_metadata()
+        self.assertEqual(reader._weight_scale_mapping, {})
+
 
 if __name__ == "__main__":
     run_tests()

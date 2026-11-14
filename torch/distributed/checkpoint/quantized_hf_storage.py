@@ -3,6 +3,7 @@ import dataclasses
 import json
 import logging
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -69,11 +70,18 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
         # Cache for full tensor shapes (fqn -> shape)
         self._tensor_full_shapes: dict[str, torch.Size] = {}
 
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        super().reset(checkpoint_id)
+        self._weight_scale_mapping = {}
+        self._weight_map = {}
+        self._tensor_full_shapes = {}
+
     def read_metadata(self) -> Any:
         metadata = super().read_metadata()
 
         # Load quantization metadata first.
         self._load_quantization_metadata()
+        self._tensor_full_shapes = {}
 
         # Build a cache of FQN -> full tensor shape, correcting for quantized tensors.
         for fqn, tensor_metadata in metadata.state_dict_metadata.items():
@@ -159,6 +167,7 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
         """Analyze and build weight-scale tensor pairs from weight mapping."""
         # Store the complete weight map for file location lookups.
         self._weight_map = weight_map
+        self._weight_scale_mapping = {}
 
         for tensor_name in weight_map:
             if tensor_name.endswith(".weight_scale_inv"):

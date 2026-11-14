@@ -41,17 +41,20 @@ class _FileSystem(FileSystemBase):
 
         # fsspec does not support concurrent transactions, and not all
         # AbstractFileSystem have working rollback implementations, so
-        # just manually delete the file if necessary on errors.
-        with self.fs.open(path, mode) as stream:
-            try:
+        # just manually delete the file if necessary on errors. Delete only
+        # after the stream is closed: object stores commit the upload on close,
+        # so deleting first would leave the partial object behind.
+        stream = self.fs.open(path, mode)
+        try:
+            with stream:
                 yield stream
-            except:
-                if any(ch in mode for ch in "w+a"):  # cleanup file if not read-only
-                    try:
-                        self.rm_file(path)
-                    except:  # noqa: E722
-                        pass
-                raise
+        except:
+            if any(ch in mode for ch in "w+a"):  # cleanup file if not read-only
+                try:
+                    self.rm_file(path)
+                except:  # noqa: E722
+                    pass
+            raise
 
     def concat_path(self, path: str | os.PathLike, suffix: str) -> str | os.PathLike:
         return os.path.join(path, suffix)

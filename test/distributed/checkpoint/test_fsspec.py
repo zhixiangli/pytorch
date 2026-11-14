@@ -175,6 +175,24 @@ class TestFileSystem(TestCase):
                 raise OSError("fail")
         self.assertTrue(fs.exists(read_file))
 
+    def test_remove_on_fail_when_close_commits(self) -> None:
+        # AbstractBufferedFile (gcsfs, s3fs, ...) commits on close(), not open().
+        fs = _FileSystem()
+        write_file = fs.concat_path(fs.init_path("memory://remove_on_fail"), "f")
+        self.addCleanup(
+            lambda: fs.rm_file(write_file) if fs.exists(write_file) else None
+        )
+        with patch.object(
+            fsspec.implementations.memory.MemoryFile,
+            "close",
+            fsspec.implementations.memory.MemoryFile.commit,
+        ):
+            with self.assertRaises(OSError):
+                with fs.create_stream(write_file, "wb") as s:
+                    s.write(b"aaa")
+                    raise OSError("fail")
+        self.assertFalse(fs.exists(write_file))
+
     @patch("os.sync")
     def test_fsspec_without_fileno_support(self, mock_os_sync):
         """
