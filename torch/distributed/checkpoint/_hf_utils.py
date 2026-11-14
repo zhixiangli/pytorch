@@ -1,14 +1,15 @@
+import functools
 import io
 import json
 import math
 import os
 import struct
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import EllipsisType
-from typing import Any, TYPE_CHECKING, TypeVar
+from typing import Any, cast, NamedTuple, TYPE_CHECKING, TypeVar
 
 import torch
 
@@ -59,6 +60,11 @@ NUM_BYTES_FOR_HEADER_LEN = 8
 SHARDED_DIR_NAME = "sharded"
 
 _MAX_REMOTE_READ_THREADS = 16
+# iter_slices fetches about this many bytes per batch of concurrent ranged reads,
+# split into chunks so a single large tensor is also fetched concurrently. It fetches
+# the next batch while turning the current one into tensors.
+_RANGED_READ_BATCH_BYTES = 512 * 1024 * 1024
+_RANGED_READ_CHUNK_BYTES = 32 * 1024 * 1024
 
 _T = TypeVar("_T")
 
@@ -159,6 +165,16 @@ def _map_over_files(
         return list(ex.map(fn, files))
 
 
+class _RangePlan(NamedTuple):
+    """The data bytes to read for one index, and how to turn them into the result."""
+
+    offset: int
+    nbytes: int
+    dtype: torch.dtype
+    rows_shape: list[int]
+    rows_index: _Index | tuple[_Index, ...]
+
+
 class _FsspecSafetensorsSlice:
     def __init__(self, file: "_FsspecSafetensorsFile", name: str) -> None:
         self._file = file
@@ -171,13 +187,17 @@ class _FsspecSafetensorsSlice:
         return self._info[DTYPE_KEY]
 
     def __getitem__(self, index: _Index | tuple[_Index, ...]) -> torch.Tensor:
+        plan = self._plan(index)
+        return self._file._read_tensor(plan)[plan.rows_index]
+
+    def _plan(self, index: _Index | tuple[_Index, ...]) -> _RangePlan:
         from safetensors.torch import _getdtype  # type: ignore[import]
 
         shape = self.get_shape()
         dtype = _getdtype(self.get_dtype())
         begin, end = self._info[DATA_OFFSETS_KEY]
         if not shape:
-            return self._file._read_tensor(begin, end - begin, dtype, [])[index]
+            return _RangePlan(begin, end - begin, dtype, [], index)
         index = index if isinstance(index, tuple) else (index,)
         if any(i is Ellipsis for i in index):
             e = next(n for n, i in enumerate(index) if i is Ellipsis)
@@ -195,20 +215,31 @@ class _FsspecSafetensorsSlice:
             raise TypeError(f"Unsupported index: {index!r}")
         # Read only the dim-0 rows covering the request, then index them in memory.
         row_nbytes = math.prod(shape[1:]) * dtype.itemsize
-        rows = self._file._read_tensor(
+        rows_shape = [stop - start, *shape[1:]]
+        return _RangePlan(
             begin + start * row_nbytes,
             (stop - start) * row_nbytes,
             dtype,
-            [stop - start, *shape[1:]],
+            rows_shape,
+            (first, *rest),
         )
-        return rows[(first, *rest)]
 
 
 class _FsspecSafetensorsFile:
     """The ``safetensors.safe_open`` API that DCP uses, over an fsspec stream."""
 
-    def __init__(self, stream: io.IOBase) -> None:
-        self._stream = stream
+    def __init__(
+        self,
+        stream: io.IOBase,
+        cat_ranges: Callable[[list[str], list[int], list[int]], list[bytes]]
+        | None = None,
+        path: str | None = None,
+    ) -> None:
+        # Binary fsspec and local file streams provide readinto.
+        self._stream = cast(io.BufferedIOBase, stream)
+        # With fsspec's cat_ranges and the path, iter_slices fetches ranges concurrently.
+        self._cat_ranges = cat_ranges
+        self._path = path
         header, self._data_start = _get_safetensors_file_metadata(stream)
         self._metadata = header.pop(DEFAULT_EXTRA_METADATA_KEY, None)
         self._header = header
@@ -231,19 +262,69 @@ class _FsspecSafetensorsFile:
     def get_tensor(self, name: str) -> torch.Tensor:
         return self.get_slice(name)[()]
 
-    def _read_tensor(
-        self, offset: int, nbytes: int, dtype: torch.dtype, shape: list[int]
-    ) -> torch.Tensor:
-        if nbytes == 0:
-            return torch.empty(shape, dtype=dtype)
-        self._stream.seek(self._data_start + offset)
-        data = bytearray(self._stream.read(nbytes))
-        if len(data) != nbytes:
+    def iter_slices(
+        self, requests: Sequence[tuple[str, _Index | tuple[_Index, ...]]]
+    ) -> Iterator[torch.Tensor]:
+        """Yield ``get_slice(name)[index]`` for each request, fetching the byte ranges in concurrent batches."""
+        if self._cat_ranges is None or not requests:
+            yield from (self.get_slice(name)[index] for name, index in requests)
+            return
+        batches: list[list[_RangePlan]] = [[]]
+        batch_bytes = 0
+        for name, index in requests:
+            if batch_bytes >= _RANGED_READ_BATCH_BYTES:
+                batches.append([])
+                batch_bytes = 0
+            plan = self.get_slice(name)._plan(index)
+            batches[-1].append(plan)
+            batch_bytes += plan.nbytes
+        with ThreadPoolExecutor(max_workers=1) as prefetcher:
+            pending = prefetcher.submit(self._fetch_batch, batches[0])
+            for n, batch in enumerate(batches):
+                parts = pending.result()
+                # Fetch the next batch while this one is turned into tensors.
+                if n + 1 < len(batches):
+                    pending = prefetcher.submit(self._fetch_batch, batches[n + 1])
+                for plan, chunks in zip(batch, parts):
+                    data = bytearray().join(chunks)
+                    yield self._to_tensor(data, len(data), plan)[plan.rows_index]
+
+    def _fetch_batch(self, plans: list[_RangePlan]) -> list[list[bytes]]:
+        """Fetch the data bytes of ``plans`` concurrently, as chunks per plan."""
+        if self._cat_ranges is None or self._path is None:
+            raise AssertionError("_fetch_batch needs cat_ranges and the path")
+        owners, starts, ends = [], [], []
+        for n, plan in enumerate(plans):
+            stop = plan.offset + plan.nbytes
+            for lo in range(plan.offset, stop, _RANGED_READ_CHUNK_BYTES):
+                owners.append(n)
+                starts.append(self._data_start + lo)
+                ends.append(self._data_start + min(lo + _RANGED_READ_CHUNK_BYTES, stop))
+        parts: list[list[bytes]] = [[] for _ in plans]
+        chunks = self._cat_ranges([self._path] * len(starts), starts, ends)
+        for n, chunk in zip(owners, chunks):
+            parts[n].append(chunk)
+        return parts
+
+    def _read_tensor(self, plan: _RangePlan) -> torch.Tensor:
+        self._stream.seek(self._data_start + plan.offset)
+        # readinto lets filesystems that support it write straight into the result.
+        data = bytearray(plan.nbytes)
+        view, got = memoryview(data), 0
+        while got < plan.nbytes and (n := self._stream.readinto(view[got:])):
+            got += n
+        return self._to_tensor(data, got, plan)
+
+    @staticmethod
+    def _to_tensor(data: bytearray, got: int, plan: _RangePlan) -> torch.Tensor:
+        if got != plan.nbytes:
             raise ValueError(
-                f"Truncated safetensors file: expected {nbytes} bytes at data offset "
-                f"{offset}, got {len(data)}"
+                f"Truncated safetensors file: expected {plan.nbytes} bytes at data "
+                f"offset {plan.offset}, got {got}"
             )
-        return torch.frombuffer(data, dtype=dtype).view(shape)
+        if plan.nbytes == 0:
+            return torch.empty(plan.rows_shape, dtype=plan.dtype)
+        return torch.frombuffer(data, dtype=plan.dtype).view(plan.rows_shape)
 
 
 @contextmanager
@@ -258,8 +339,16 @@ def _open_safetensors(
         with safe_open(path, framework="pt") as f:
             yield f
     else:
+        from torch.distributed.checkpoint.fsspec_filesystem import _FileSystem
+
         with _open_for_ranged_reads(fs, path) as stream:
-            yield _FsspecSafetensorsFile(stream)
+            remote = fs.fs if isinstance(fs, _FileSystem) else None
+            cat_ranges = (
+                functools.partial(remote.cat_ranges, on_error="raise")
+                if remote is not None
+                else None
+            )
+            yield _FsspecSafetensorsFile(stream, cat_ranges, os.fspath(path))
 
 
 def _open_safetensors_headers(

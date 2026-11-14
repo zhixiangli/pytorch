@@ -174,6 +174,13 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
                 if packed_name in weight_map:
                     self._weight_scale_mapping[packed_name] = tensor_name
 
+    def _process_read_requests(
+        self, f: Any, reqs: list[ReadItem], planner: LoadPlanner
+    ) -> None:
+        # Dequantization reads weights and scales per request, so keep the per-request path.
+        for req in reqs:
+            self._process_read_request(f, req, planner)
+
     def _process_read_request(
         self, f: Any, req: ReadItem, planner: LoadPlanner
     ) -> None:

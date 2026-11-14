@@ -15,6 +15,7 @@ from fsspec.implementations.local import LocalFileSystem
 
 import torch
 import torch.distributed.checkpoint as dist_cp
+from torch.distributed.checkpoint import _hf_utils
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files,
     consolidate_safetensors_files_on_every_rank,
@@ -40,6 +41,34 @@ from torch.testing._internal.common_utils import (
 
 
 HAS_SAFETENSORS = importlib.util.find_spec("safetensors") is not None
+
+# (tensor name, index) pairs that safe_open accepts for TestFsspecSafetensorsFile's tensors.
+_VALID_INDEXES = [
+    ("a", ()),
+    ("a", (slice(1, 3),)),
+    ("a", (slice(None), slice(2, 5))),
+    ("a", (slice(1, 3), slice(0, 4))),
+    ("a", (slice(3, 3),)),
+    ("a", (slice(3, 1),)),
+    ("a", (slice(-2, None),)),
+    ("a", (slice(0, 4, 2),)),
+    ("a", (slice(None), slice(0, 6, 2))),
+    ("a", 1),
+    ("a", -1),
+    ("a", (slice(None), 0)),
+    ("a", (1, 2)),
+    ("a", Ellipsis),
+    ("a", (Ellipsis, slice(1, 3))),
+    ("a", (0, Ellipsis)),
+    ("b", (slice(1, 2), slice(None), slice(0, 1))),
+    ("b", (Ellipsis, 0)),
+    ("s", ()),
+    ("s", Ellipsis),
+    ("u8", (slice(1, 3), slice(1, 4))),
+    ("i32", (slice(2, 4),)),
+    ("f8", (slice(2, 5),)),
+    ("bool", (slice(1, 2),)),
+]
 
 
 class _MemoryFsTestCase(TestCase):
@@ -111,35 +140,7 @@ class TestFsspecSafetensorsFile(_MemoryFsTestCase):
                     remote.get_slice(key).get_dtype(), local.get_slice(key).get_dtype()
                 )
 
-    @parametrize(
-        "key,index",
-        [
-            ("a", ()),
-            ("a", (slice(1, 3),)),
-            ("a", (slice(None), slice(2, 5))),
-            ("a", (slice(1, 3), slice(0, 4))),
-            ("a", (slice(3, 3),)),
-            ("a", (slice(3, 1),)),
-            ("a", (slice(-2, None),)),
-            ("a", (slice(0, 4, 2),)),
-            ("a", (slice(None), slice(0, 6, 2))),
-            ("a", 1),
-            ("a", -1),
-            ("a", (slice(None), 0)),
-            ("a", (1, 2)),
-            ("a", Ellipsis),
-            ("a", (Ellipsis, slice(1, 3))),
-            ("a", (0, Ellipsis)),
-            ("b", (slice(1, 2), slice(None), slice(0, 1))),
-            ("b", (Ellipsis, 0)),
-            ("s", ()),
-            ("s", Ellipsis),
-            ("u8", (slice(1, 3), slice(1, 4))),
-            ("i32", (slice(2, 4),)),
-            ("f8", (slice(2, 5),)),
-            ("bool", (slice(1, 2),)),
-        ],
-    )
+    @parametrize("key,index", _VALID_INDEXES)
     def test_index_matches_safe_open(self, key, index) -> None:
         local_fs, _ = _get_fs_and_path(self.local_path)
         with (
@@ -201,6 +202,33 @@ class TestFsspecSafetensorsFile(_MemoryFsTestCase):
         with _open_safetensors(self.remote_fs, path) as remote:
             with self.assertRaisesRegex(ValueError, "Truncated safetensors file"):
                 remote.get_tensor("x")
+            with self.assertRaisesRegex(ValueError, "Truncated safetensors file"):
+                list(remote.iter_slices([("x", ())]))
+
+    def test_iter_slices_matches_indexing(self) -> None:
+        # Tiny batches and chunks, so requests span batches and tensors span chunks.
+        cat_ranges = self.remote_fs.fs.cat_ranges
+        with (
+            mock.patch.object(_hf_utils, "_RANGED_READ_BATCH_BYTES", 40),
+            mock.patch.object(_hf_utils, "_RANGED_READ_CHUNK_BYTES", 16),
+            mock.patch.object(self.remote_fs.fs, "cat_ranges", wraps=cat_ranges) as spy,
+            _open_safetensors(self.remote_fs, self.remote_path) as remote,
+        ):
+            results = list(remote.iter_slices(_VALID_INDEXES))
+        for (key, index), result in zip(_VALID_INDEXES, results, strict=True):
+            self.assertEqual(result, self.tensors[key][index])
+        self.assertGreater(spy.call_count, 1)
+        self.assertLess(spy.call_count, len(_VALID_INDEXES))
+
+    def test_iter_slices_fetches_requests_together(self) -> None:
+        cat_ranges = self.remote_fs.fs.cat_ranges
+        with (
+            mock.patch.object(self.remote_fs.fs, "cat_ranges", wraps=cat_ranges) as spy,
+            _open_safetensors(self.remote_fs, self.remote_path) as remote,
+        ):
+            results = list(remote.iter_slices([(key, ()) for key in self.tensors]))
+        self.assertEqual(results, list(self.tensors.values()))
+        spy.assert_called_once()
 
 
 @unittest.skipIf(not HAS_SAFETENSORS, "safetensors not installed")

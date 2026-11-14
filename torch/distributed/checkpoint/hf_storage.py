@@ -13,6 +13,7 @@ from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files,
 )
 from torch.distributed.checkpoint._hf_utils import (
+    _FsspecSafetensorsFile,
     _gen_file_name,
     _get_fs_and_path,
     _HFStorageInfo,
@@ -259,14 +260,34 @@ class HuggingFaceStorageReader(FileSystemReader):
             return _FileSystem.validate_checkpoint_id(checkpoint_id)
         return super().validate_checkpoint_id(checkpoint_id)
 
-    def _process_read_request(self, f, req: ReadItem, planner: LoadPlanner) -> None:
-        """Helper function to process a single read request."""
+    @staticmethod
+    def _request_slices(req: ReadItem) -> tuple[slice, ...]:
         # Create slices for each dimension based on offsets and lengths
-        slices = tuple(
+        return tuple(
             slice(offset, offset + length)
             for offset, length in zip(req.storage_offsets, req.lengths)
         )
-        tensor = f.get_slice(req.storage_index.fqn)[slices]
+
+    def _process_read_requests(
+        self, f: Any, reqs: list[ReadItem], planner: LoadPlanner
+    ) -> None:
+        """Process the read requests of one open safetensors file."""
+        if isinstance(f, _FsspecSafetensorsFile):
+            # Each request is a round trip on remote storage, so fetch them concurrently.
+            requests = [(r.storage_index.fqn, self._request_slices(r)) for r in reqs]
+            for req, tensor in zip(reqs, f.iter_slices(requests)):
+                self._commit_read(req, tensor, planner)
+        else:
+            for req in reqs:
+                self._process_read_request(f, req, planner)
+
+    def _process_read_request(self, f, req: ReadItem, planner: LoadPlanner) -> None:
+        """Helper function to process a single read request."""
+        tensor = f.get_slice(req.storage_index.fqn)[self._request_slices(req)]
+        self._commit_read(req, tensor, planner)
+
+    @staticmethod
+    def _commit_read(req: ReadItem, tensor: torch.Tensor, planner: LoadPlanner) -> None:
         target_tensor = planner.resolve_tensor(req).detach()
 
         if target_tensor.size() != tensor.size():
@@ -287,8 +308,7 @@ class HuggingFaceStorageReader(FileSystemReader):
             while True:
                 file_name, reqs = file_queue.get_nowait()
                 with _open_safetensors(self.fs, file_name) as f:
-                    for req in reqs:
-                        self._process_read_request(f, req, planner)
+                    self._process_read_requests(f, reqs, planner)
                 result_queue.put(True)  # Signal that this file has been processed
         except queue.Empty:
             pass
@@ -304,8 +324,7 @@ class HuggingFaceStorageReader(FileSystemReader):
         if self.thread_count <= 1 or len(per_file) <= 1:
             for file_name, reqs in per_file.items():
                 with _open_safetensors(self.fs, file_name) as f:
-                    for req in reqs:
-                        self._process_read_request(f, req, planner)
+                    self._process_read_requests(f, reqs, planner)
         else:
             # Use parallel implementation with thread pool
             file_queue: queue.Queue = queue.Queue()
